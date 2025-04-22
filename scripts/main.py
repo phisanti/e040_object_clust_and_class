@@ -54,16 +54,16 @@ def main():
 
     # Setup transforms
     train_transform = Compose([
-        ScaleIntensity(),
+        #ScaleIntensity(),
         RandRotate90(prob=0.5),
         RandGaussianNoise(prob=0.5, mean=0.0, std=0.1),
         RandGaussianSmooth(prob=0.5, sigma_x=(0.1, 1.1), sigma_y=(0.1, 1.1)),
-        RandZoom(prob=0.5, min_zoom=0.8, max_zoom=1.2),
+        RandZoom(prob=0.5, min_zoom=0.75, max_zoom=1.25),
         ToTensor()
     ])
     
     val_transform = Compose([
-        ScaleIntensity(),
+        #ScaleIntensity(),
         ToTensor()
     ])
 
