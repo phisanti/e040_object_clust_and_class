@@ -185,7 +185,8 @@ class ObjectClassifDatasetCreator:
         train_transform: Optional[Callable] = None,
         val_transform: Optional[Callable] = None,
         batch_size: int = 32,
-        dynamic_resizing: bool = False
+        dynamic_resizing: bool = False,
+        segment_objects: bool = True
     ) -> Tuple[DataLoader, DataLoader]:
         """
         Create training and validation datasets/dataloaders.
@@ -195,6 +196,7 @@ class ObjectClassifDatasetCreator:
             val_transform: Transformations to apply to validation data
             batch_size: Batch size for dataloaders
             dynamic_resizing: If True, only resize objects larger than resize_dim
+            segment_objects: If True, applies segmentation masks to objects
         
         Returns:
             Tuple containing training and validation DataLoaders
@@ -211,7 +213,8 @@ class ObjectClassifDatasetCreator:
             self.image_info,
             transform=train_transform,
             resize_dim=self.resize_dim,
-            dynamic_resizing=dynamic_resizing
+            dynamic_resizing=dynamic_resizing,
+            segment_objects=segment_objects
         )
         
         val_dataset = ObjectClassifDataset(
@@ -220,7 +223,8 @@ class ObjectClassifDatasetCreator:
             self.image_info,
             transform=val_transform,
             resize_dim=self.resize_dim,
-            dynamic_resizing=dynamic_resizing
+            dynamic_resizing=dynamic_resizing,
+            segment_objects=segment_objects
         )
         
         # Create dataloaders
