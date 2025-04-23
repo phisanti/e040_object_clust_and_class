@@ -1,8 +1,12 @@
 import os
 import json
 import numpy as np
-from typing import Dict, List, Tuple, Optional, Any, Union, Callable
 import tifffile
+from pycocotools import mask as mask_utils
+
+from typing import Dict, List, Tuple, Optional, Any, Union, Callable
+
+
 
 import torch
 import torch.nn.functional as F
@@ -16,14 +20,18 @@ class ObjectClassifDataset(Dataset):
         image_dir: str,
         image_info: Dict[int, Dict],
         transform: Optional[Callable] = None,
-        resize_dim: int = 64
+        segment_objects: bool = True,
+        resize_dim: int = 64,
+        dynamic_resizing: bool = False
     ):
         self.annotations = annotations
         self.image_dir = image_dir
         self.image_info = image_info
         self.transform = transform
         self.resize_dim = resize_dim
-        self.image_cache = {}  # Cache for loaded images
+        self.image_cache = {}
+        self.segment_objects = segment_objects
+        self.dynamic_resizing = dynamic_resizing
         
     def __len__(self):
         return len(self.annotations)
@@ -33,6 +41,7 @@ class ObjectClassifDataset(Dataset):
         image_id = annotation["image_id"]
         category_id = annotation["category_id"]
         bbox = annotation["bbox"]
+        segmentation = annotation["segmentation"]
         
         # Get image info
         img_info = self.image_info[image_id]
@@ -56,13 +65,53 @@ class ObjectClassifDataset(Dataset):
         # Extract object using bbox [x, y, width, height]
         x, y, w, h = [int(v) for v in bbox]
         obj_img = image[y:y+h, x:x+w]
+        
+        # Apply segmentation mask if requested
+        if self.segment_objects and segmentation:
+            if isinstance(segmentation, list) and len(segmentation) > 0:
+                rles = mask_utils.frPyObjects(segmentation, img_info["height"], img_info["width"])
+                full_mask = mask_utils.decode(mask_utils.merge(rles))
+                
+                mask = torch.from_numpy(full_mask[y:y+h, x:x+w]).float()
+                
+                if mask.dim() < obj_img.dim():
+                    mask = mask.unsqueeze(0)
+                obj_img = obj_img * mask
 
         # Add channel dimension if needed
         if obj_img.dim() == 2:
             obj_img = obj_img.unsqueeze(0)  # [H,W] -> [1,H,W]
         
-        # Resize
-        if obj_img.shape[-2] != self.resize_dim or obj_img.shape[-1] != self.resize_dim:
+        # Get current dimensions
+        c, h, w = obj_img.shape
+        
+        # Resize logic based on dynamic_resizing flag
+        if self.dynamic_resizing:
+            # Only resize if object is larger than resize_dim in any dimension
+            if h > self.resize_dim or w > self.resize_dim:
+                # Calculate scaling to maintain aspect ratio (only downscale, never upscale)
+                scale = self.resize_dim / max(h, w)
+                new_h, new_w = int(h * scale), int(w * scale)
+                
+                # Apply resize
+                obj_img = obj_img.unsqueeze(0)  # [C,H,W] -> [1,C,H,W]
+                obj_img = F.interpolate(obj_img, size=(new_h, new_w), mode='bilinear', align_corners=False)
+                obj_img = obj_img.squeeze(0)  # [1,C,H,W] -> [C,H,W]
+            
+            # Pad to target size
+            pad_h = max(0, self.resize_dim - obj_img.shape[1])
+            pad_w = max(0, self.resize_dim - obj_img.shape[2])
+            
+            if pad_h > 0 or pad_w > 0:
+                pad_top = pad_h // 2
+                pad_bottom = pad_h - pad_top
+                pad_left = pad_w // 2
+                pad_right = pad_w - pad_left
+                
+                obj_img = F.pad(obj_img, (pad_left, pad_right, pad_top, pad_bottom), 
+                            mode='constant', value=0)
+        else:
+            # Original resizing logic - always resize to maintain aspect ratio
             obj_img = obj_img.unsqueeze(0)  # [C,H,W] -> [1,C,H,W]
             
             # Calculate scaling to maintain aspect ratio
@@ -136,6 +185,7 @@ class ObjectClassifDatasetCreator:
         train_transform: Optional[Callable] = None,
         val_transform: Optional[Callable] = None,
         batch_size: int = 32,
+        dynamic_resizing: bool = False
     ) -> Tuple[DataLoader, DataLoader]:
         """
         Create training and validation datasets/dataloaders.
@@ -144,7 +194,8 @@ class ObjectClassifDatasetCreator:
             train_transform: Transformations to apply to training data
             val_transform: Transformations to apply to validation data
             batch_size: Batch size for dataloaders
-            
+            dynamic_resizing: If True, only resize objects larger than resize_dim
+        
         Returns:
             Tuple containing training and validation DataLoaders
         """
@@ -159,7 +210,8 @@ class ObjectClassifDatasetCreator:
             self.image_dir,
             self.image_info,
             transform=train_transform,
-            resize_dim=self.resize_dim
+            resize_dim=self.resize_dim,
+            dynamic_resizing=dynamic_resizing
         )
         
         val_dataset = ObjectClassifDataset(
@@ -167,7 +219,8 @@ class ObjectClassifDatasetCreator:
             self.image_dir,
             self.image_info,
             transform=val_transform,
-            resize_dim=self.resize_dim
+            resize_dim=self.resize_dim,
+            dynamic_resizing=dynamic_resizing
         )
         
         # Create dataloaders
