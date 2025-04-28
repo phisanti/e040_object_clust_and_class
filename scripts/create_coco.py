@@ -25,11 +25,13 @@ import tifffile
 import argparse
 from tqdm import tqdm
 from pathlib import Path
-from scipy.ndimage import label
 from skimage import measure
+from shapely.geometry import Polygon, MultiPolygon
+import datetime
+from concurrent.futures import ProcessPoolExecutor, as_completed, ThreadPoolExecutor
+import multiprocessing
 
 def parse_arguments():
-    """Parse command line arguments."""
     parser = argparse.ArgumentParser(description='Extract COCO annotations from classified object images.')
     parser.add_argument('-i', '--input_dir', type=str, 
                         default="../../Semantic_bac_segment/data/tmp_stacks/objects_images/",
@@ -37,168 +39,211 @@ def parse_arguments():
     parser.add_argument('-o', '--output_file', type=str, 
                         default="./data/objects_annotations/annotations.json",
                         help='Path to save the COCO annotations JSON file')
+    parser.add_argument('-w', '--workers', type=int,
+                        default=None,
+                        help='Number of parallel workers: None (default) = single process, 0 = all cores, >0 = specific number')
     return parser.parse_args()
 
-
 def initialize_coco_structure():
-    """Initialize the COCO format data structure."""
     return {
+        "info": {
+            "description": "Cell Object Dataset",
+            "url": "",
+            "version": "1.0",
+            "year": datetime.datetime.now().year,
+            "contributor": "",
+            "date_created": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        },
+        "licenses": [
+            {
+                "id": 1,
+                "name": "Creative Commons Attribution 4.0 International (CC BY 4.0)",
+                "url": "https://creativecommons.org/licenses/by/4.0/"
+            }
+        ],
         "images": [],
         "annotations": [],
         "categories": [
-            {"id": 1, "name": "cell"},
-            {"id": 2, "name": "clump"},
-            {"id": 3, "name": "noise"},
-            {"id": 4, "name": "off-focus"},
-            {"id": 5, "name": "joint cell"}
+            {"id": 1, "name": "cell", "supercategory": "cell"},
+            {"id": 2, "name": "clump", "supercategory": "cell"},
+            {"id": 3, "name": "noise", "supercategory": "artifact"},
+            {"id": 4, "name": "off-focus", "supercategory": "artifact"},
+            {"id": 5, "name": "joint cell", "supercategory": "cell"}
         ]
     }
 
-
 def get_tiff_files(input_dir):
-    """Get a sorted list of all TIFF files in the input directory."""
-    tiff_files = sorted([f for f in os.listdir(input_dir) if f.lower().endswith(('.tif', '.tiff'))])
-    return tiff_files
+    return sorted([f for f in os.listdir(input_dir) if f.lower().endswith(('.tif', '.tiff'))])
 
+def create_sub_mask_annotation(sub_mask, image_id, category_id, annotation_id, is_crowd):
+    """
+    Generate a COCO-style annotation for a single object mask, including support for occlusions and holes.
 
-def process_image(img, image_id, tiff_file, annotation_id, coco_data):
-    """Process a single image and extract annotations for all objects."""
-    from scipy.ndimage import label
-    
-    # Add image info
+        Args:
+        sub_mask (np.ndarray): Binary mask for the object (2D array).
+        image_id (int): ID of the image containing the object.
+        category_id (int): COCO category ID for the object.
+        annotation_id (int): Unique annotation ID.
+        is_crowd (int): COCO iscrowd flag.
+
+    Returns:
+        dict: COCO-style annotation dictionary with segmentation, bbox, area, etc., or None if no valid polygons found.
+
+    General strategy:
+        - The function extracts all contours from the binary mask using skimage's find_contours.
+        - Each contour is converted to a polygon, simplified, and filtered for validity.
+        - All valid polygons are collected and used to compute the segmentation, bounding box, and area.
+        - **A ring of 0s (padding) is added around the mask before contour extraction.**
+          This is necessary to ensure that objects touching the image border (even at multiple or disconnected points)
+          are properly closed and detected as valid polygons.
+
+    Occluded objects:
+        - If an object is split into multiple visible parts (due to occlusion), each part is detected as a separate contour.
+        - All such parts are included as separate polygons in the segmentation, allowing for multi-part object annotation.
+
+    Holes:
+        - Holes within objects are detected as inner contours with opposite orientation (counter-clockwise).
+        - These are included in the segmentation list and can be distinguished by their orientation.
+        - This enables downstream tools to correctly subtract holes from the filled object mask.
+
+    Why:
+        - This approach is necessary to accurately represent complex biological objects that may be occluded or contain holes (e.g., vacuoles, artifacts).
+        - Properly encoding both visible parts and holes ensures that segmentation masks and downstream analyses (e.g., mask rasterization, visualization) are correct and biologically meaningful.
+    """
+    # Add a ring of 0s (padding) around the mask
+    padded_mask = np.pad(sub_mask, pad_width=1, mode='constant', constant_values=0)
+    # Find contours (boundary lines) around each sub-mask
+    contours = measure.find_contours(padded_mask, 0.5)
+    segmentations = []
+    segment_types = []
+    polygons = []
+
+    for contour in contours:
+        # Flip from (row, col) to (x, y) and subtract the padding pixel
+        contour = np.array([(col - 1, row - 1) for row, col in contour])
+        poly = Polygon(contour)
+        if not poly.is_valid or poly.is_empty:
+            continue
+        poly = poly.simplify(1.0, preserve_topology=False)
+        if poly.is_empty or not poly.is_valid:
+            continue
+        # Determine orientation: 0 for normal (clockwise), 1 for hole (counter-clockwise)
+        orientation = 0 if poly.exterior.is_ccw is False else 1
+        polygons.append(poly)
+        segmentation = np.array(poly.exterior.coords).ravel().tolist()
+        if len(segmentation) >= 6:
+            segmentations.append(segmentation)
+            segment_types.append(orientation)
+    if not polygons:
+        return None
+    multi_poly = MultiPolygon(polygons)
+    x, y, max_x, max_y = multi_poly.bounds
+    width = max_x - x
+    height = max_y - y
+    bbox = [x, y, width, height]
+    area = multi_poly.area
+    annotation = {
+        'segmentation': segmentations,
+        'segmentation_types': segment_types,  
+        'iscrowd': is_crowd,
+        'image_id': image_id,
+        'category_id': category_id,
+        'id': annotation_id,
+        'bbox': bbox,
+        'area': area
+    }
+    return annotation
+
+def process_image(args):
+    img, image_id, tiff_file, annotation_id, max_classes = args
+    coco_annotations = []
     height, width = img.shape
-    coco_data["images"].append({
+    image_info = {
         "id": image_id,
         "file_name": tiff_file,
         "width": width,
-        "height": height
-    })
-    
-    # Find unique object class IDs (excluding background class 0)
+        "height": height,
+        "date_captured": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "license": 1
+    }
     class_ids = np.unique(img)
     class_ids = class_ids[class_ids > 0]
-    
-    # Process each class
     for class_id in class_ids:
-        if class_id > 5:  # Skip invalid class IDs
+        if class_id > max_classes:
             continue
-            
-        # Create binary mask for this class
         class_mask = (img == class_id)
-        
-        # Label connected components to identify individual objects
-        labeled_mask, num_objects = label(class_mask)
-        
-        # Process each individual object within this class
+        labeled_mask, num_objects = measure.label(class_mask, connectivity=1, return_num=True)
         for obj_idx in range(1, num_objects + 1):
-            # Create mask for this specific object
-            object_mask = (labeled_mask == obj_idx)
-            
-            # Find contours/bounds
-            y_indices, x_indices = np.where(object_mask)
-            if len(y_indices) == 0:
+            sub_mask = (labeled_mask == obj_idx).astype(np.uint8)
+            if np.sum(sub_mask) < 10:
                 continue
-                
-            # Bounding box: [x, y, width, height]
-            x_min, y_min = np.min(x_indices), np.min(y_indices)
-            x_max, y_max = np.max(x_indices), np.max(y_indices)
-            bbox = [int(x_min), int(y_min), int(x_max - x_min + 1), int(y_max - y_min + 1)]
-            
-            # Area
-            area = int(np.sum(object_mask))
-            
-            # Get contours
-            contours = measure.find_contours(object_mask.astype(np.uint8), 0.5)
-            
-            segmentation = []
-            for contour in contours:
-                # Flip xy to yx for COCO format and flatten
-                contour = np.fliplr(contour).flatten().tolist()
-                # COCO requires at least 6 points (3 xy coordinates)
-                if len(contour) >= 6:
-                    segmentation.append(contour)
-            
-            # If no valid contours found, create a simple box contour
-            if not segmentation:
-                # Create a simple box contour
-                box_contour = [
-                    x_min, y_min,
-                    x_max, y_min,
-                    x_max, y_max,
-                    x_min, y_max
-                ]
-                segmentation.append(box_contour)
-            
-            # Add annotation
-            coco_data["annotations"].append({
-                "id": annotation_id,
-                "image_id": image_id,
-                "category_id": int(class_id),
-                "bbox": bbox,
-                "segmentation": segmentation,
-                "area": area,
-                "iscrowd": 0
-            })
-            
-            annotation_id += 1
-    
-    return annotation_id
+            annotation = create_sub_mask_annotation(
+                sub_mask, image_id, int(class_id), annotation_id, is_crowd=0
+            )
+            if annotation is not None:
+                annotation['id'] = annotation_id
+                coco_annotations.append(annotation)
+                annotation_id += 1
+    return image_info, coco_annotations
 
-
-
-
-def create_coco_annotations(input_dir, output_file):
-    """
-    Extract COCO annotations from classified object images.
-    
-    Args:
-        input_dir: Path to directory containing classified object TIFF images
-        output_file: Path to save the COCO annotations JSON file
-    """
-    # Create output directory if it doesn't exist
+def create_coco_annotations(input_dir, output_file, max_classes, workers=None):
     os.makedirs(os.path.dirname(output_file), exist_ok=True)
-    
-    # Initialize COCO format structure
     coco_data = initialize_coco_structure()
-    
-    # List all TIFF files
     tiff_files = get_tiff_files(input_dir)
-    
     if not tiff_files:
         print(f"No TIFF files found in {input_dir}")
         return
-    
+
+    # Set workers
+    if workers is None:
+        num_workers = 1
+    elif workers == 0:
+        num_workers = multiprocessing.cpu_count()
+    elif workers > 0:
+        num_workers = workers
+
     annotation_id = 1
-    
-    # Process each image
-    for image_id, tiff_file in enumerate(tqdm(tiff_files, desc="Processing images", position=0, leave=True), 1):
+    image_args = []
+    annotation_ids = []
+    for image_id, tiff_file in enumerate(tiff_files, 1):
         file_path = os.path.join(input_dir, tiff_file)
         try:
-            # Load the image
             img = tifffile.imread(file_path)
-            annotation_id = process_image(img, image_id, tiff_file, annotation_id, coco_data)
-                
+            if len(img.shape) > 2:
+                img = img[:, :, 0] if img.shape[2] <= 3 else img[0]
+            image_args.append((img, image_id, tiff_file, annotation_id, max_classes))
+            annotation_ids.append(annotation_id)
         except Exception as e:
             print(f"Error processing {tiff_file}: {e}")
-    
-    # Save annotations
+            import traceback
+            traceback.print_exc()
+
+    results = []
+    with ProcessPoolExecutor(max_workers=num_workers) as executor:
+        futures = [executor.submit(process_image, arg) for arg in image_args]
+        for f in tqdm(as_completed(futures), total=len(futures), desc="Processing images"):
+            try:
+                image_info, coco_annotations = f.result()
+                coco_data["images"].append(image_info)
+                coco_data["annotations"].extend(coco_annotations)
+            except Exception as e:
+                print(f"Error in parallel processing: {e}")
+                import traceback
+                traceback.print_exc()
+
     save_annotations(coco_data, output_file)
-    
-    print(f"Processed {len(tiff_files)} images with {annotation_id-1} annotations")
+    print(f"Processed {len(tiff_files)} images with {len(coco_data['annotations'])} annotations")
     print(f"COCO annotations saved to {output_file}")
 
-
 def save_annotations(coco_data, output_file):
-    """Save the COCO annotations to a JSON file."""
     with open(output_file, 'w') as f:
         json.dump(coco_data, f, indent=2)
 
-
 def main():
-    """Main function to run the script."""
-    args = parse_arguments()
-    create_coco_annotations(args.input_dir, args.output_file)
 
+    args = parse_arguments()
+    MAXCLASSES = 5
+    create_coco_annotations(args.input_dir, args.output_file, MAXCLASSES, )
 
 if __name__ == "__main__":
     main()
