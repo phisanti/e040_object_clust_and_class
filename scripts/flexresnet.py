@@ -75,7 +75,7 @@ class FlexResNet(nn.Module):
 
 
 if __name__ == "__main__":
-    from torchsummary import summary
+    from torchinfo import summary
 
     model = FlexResNet(num_classes=2)
     dummy_input = torch.zeros(1, 1, 32, 32)
