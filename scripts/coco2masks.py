@@ -54,7 +54,7 @@ def parse_arguments() -> argparse.Namespace:
         help='Directory to save the generated mask images'
     )
     parser.add_argument(
-        '-w', '--workers', type=int, default=None,
+        '-w', '--workers', type=int, default=0,
         help='Number of parallel workers: None=1, 0=all cores, >0 specific number'
     )
     return parser.parse_args()

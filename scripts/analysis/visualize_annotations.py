@@ -88,18 +88,27 @@ def visualize_annotations(
     cats = coco.loadCats(cat_ids)
     n_cats = len(cats)
     colors = plt.cm.tab20(np.linspace(0, 1, max(20, n_cats)))
+    np.random.shuffle(colors)  # Randomize colors
     catid_to_color = {cat['id']: colors[i % len(colors)] for i, cat in enumerate(cats)}
 
     anns = coco.loadAnns(annotation_ids)
     ann_cat_ids = set(ann['category_id'] for ann in anns)
     use_single_color = len(ann_cat_ids) == 1
+
     if use_single_color:
-        # All objects are the same class: assign a unique color for each annotation (per label)
-        single_color_list = plt.cm.tab20(np.linspace(0, 1, max(20, len(anns))))
+        # Randomize colors for single class
+        n_anns = len(anns)
+        single_color_list = plt.cm.tab20(np.linspace(0, 1, max(20, n_anns)))
+        np.random.shuffle(single_color_list)
         annid_to_color = {ann['id']: single_color_list[i % len(single_color_list)] for i, ann in enumerate(anns)}
     else:
-        # Multiple classes: assign color per class
-        annid_to_color = {ann['id']: catid_to_color[ann['category_id']] for ann in anns}
+        # Ensure category_id exists in catid_to_color
+        annid_to_color = {}
+        for ann in anns:
+            cat_id = ann['category_id']
+            if cat_id not in catid_to_color:
+                catid_to_color[cat_id] = colors[len(catid_to_color) % len(colors)]
+            annid_to_color[ann['id']] = catid_to_color[cat_id]
 
     for ann in anns:
         color = annid_to_color[ann['id']]
@@ -121,7 +130,7 @@ def visualize_annotations(
     if not use_single_color:
         legend_patches = [
             mpatches.Patch(color=catid_to_color[cat['id']], label=cat['name'])
-            for cat in cats
+            for cat in cats if cat['id'] in ann_cat_ids
         ]
         ax.legend(handles=legend_patches, loc='center left', bbox_to_anchor=(1.01, 0.5), title="Categories")
     plt.tight_layout()

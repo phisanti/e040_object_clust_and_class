@@ -21,17 +21,18 @@ Usage:
 import os
 import json
 import numpy as np
+import datetime
+
 import tifffile
 import argparse
 from tqdm import tqdm
 from pathlib import Path
+from scipy.ndimage import label
 from skimage import measure
 from shapely.geometry import Polygon, MultiPolygon
-import datetime
-from concurrent.futures import ProcessPoolExecutor, as_completed, ThreadPoolExecutor
-import multiprocessing
 
 def parse_arguments():
+    """Parse command line arguments."""
     parser = argparse.ArgumentParser(description='Extract COCO annotations from classified object images.')
     parser.add_argument('-i', '--input_dir', type=str, 
                         default="../../Semantic_bac_segment/data/tmp_stacks/objects_images/",
@@ -39,10 +40,8 @@ def parse_arguments():
     parser.add_argument('-o', '--output_file', type=str, 
                         default="./data/objects_annotations/annotations.json",
                         help='Path to save the COCO annotations JSON file')
-    parser.add_argument('-w', '--workers', type=int,
-                        default=None,
-                        help='Number of parallel workers: None (default) = single process, 0 = all cores, >0 = specific number')
     return parser.parse_args()
+
 
 def initialize_coco_structure():
     return {
@@ -72,8 +71,11 @@ def initialize_coco_structure():
         ]
     }
 
+
 def get_tiff_files(input_dir):
-    return sorted([f for f in os.listdir(input_dir) if f.lower().endswith(('.tif', '.tiff'))])
+    """Get a sorted list of all TIFF files in the input directory."""
+    tiff_files = sorted([f for f in os.listdir(input_dir) if f.lower().endswith(('.tif', '.tiff'))])
+    return tiff_files
 
 def create_sub_mask_annotation(sub_mask, image_id, category_id, annotation_id, is_crowd):
     """
@@ -186,64 +188,64 @@ def process_image(args):
                 annotation_id += 1
     return image_info, coco_annotations
 
-def create_coco_annotations(input_dir, output_file, max_classes, workers=None):
+
+def create_coco_annotations(input_dir, output_file, max_classes):
+    """
+    Extract COCO annotations from classified object images.
+    
+    Args:
+        input_dir: Path to directory containing classified object TIFF images
+        output_file: Path to save the COCO annotations JSON file
+    """
+    # Create output directory if it doesn't exist
     os.makedirs(os.path.dirname(output_file), exist_ok=True)
+    
+    # Initialize COCO format structure
     coco_data = initialize_coco_structure()
+    
+    # List all TIFF files
     tiff_files = get_tiff_files(input_dir)
+    
     if not tiff_files:
         print(f"No TIFF files found in {input_dir}")
         return
-
-    # Set workers
-    if workers is None:
-        num_workers = 1
-    elif workers == 0:
-        num_workers = multiprocessing.cpu_count()
-    elif workers > 0:
-        num_workers = workers
-
+    
     annotation_id = 1
-    image_args = []
-    annotation_ids = []
-    for image_id, tiff_file in enumerate(tiff_files, 1):
+    
+    # Process each image
+    for image_id, tiff_file in enumerate(tqdm(tiff_files, desc="Processing images", position=0, leave=True), 1):
         file_path = os.path.join(input_dir, tiff_file)
         try:
+            # Load the image
             img = tifffile.imread(file_path)
-            if len(img.shape) > 2:
-                img = img[:, :, 0] if img.shape[2] <= 3 else img[0]
-            image_args.append((img, image_id, tiff_file, annotation_id, max_classes))
-            annotation_ids.append(annotation_id)
+            args = (img, image_id, tiff_file, annotation_id, max_classes)
+            image_info, coco_annotations = process_image(args)
+            coco_data["images"].append(image_info)
+            coco_data["annotations"].extend(coco_annotations)
+            annotation_id += len(coco_annotations)
+                
         except Exception as e:
             print(f"Error processing {tiff_file}: {e}")
-            import traceback
-            traceback.print_exc()
-
-    results = []
-    with ProcessPoolExecutor(max_workers=num_workers) as executor:
-        futures = [executor.submit(process_image, arg) for arg in image_args]
-        for f in tqdm(as_completed(futures), total=len(futures), desc="Processing images"):
-            try:
-                image_info, coco_annotations = f.result()
-                coco_data["images"].append(image_info)
-                coco_data["annotations"].extend(coco_annotations)
-            except Exception as e:
-                print(f"Error in parallel processing: {e}")
-                import traceback
-                traceback.print_exc()
-
+    
+    # Save annotations
     save_annotations(coco_data, output_file)
-    print(f"Processed {len(tiff_files)} images with {len(coco_data['annotations'])} annotations")
+    
+    print(f"Processed {len(tiff_files)} images with {annotation_id-1} annotations")
     print(f"COCO annotations saved to {output_file}")
 
+
 def save_annotations(coco_data, output_file):
+    """Save the COCO annotations to a JSON file."""
     with open(output_file, 'w') as f:
         json.dump(coco_data, f, indent=2)
 
-def main():
 
+def main():
+    """Main function to run the script."""
+    MAX_CLASSES=5 # For this project, the code works with 5 classes
     args = parse_arguments()
-    MAXCLASSES = 5
-    create_coco_annotations(args.input_dir, args.output_file, MAXCLASSES, )
+    create_coco_annotations(args.input_dir, args.output_file, MAX_CLASSES)
+
 
 if __name__ == "__main__":
     main()
