@@ -13,6 +13,90 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
 
+def determine_polygon_orientation(polygon):
+    """
+    Determines if a polygon is a positive area (1) or hole (0) based on its orientation.
+    
+    Args:
+        polygon (list): Polygon coordinates in flat format [x1, y1, x2, y2, ...]
+        
+    Returns:
+        int: 1 if a positive area (clockwise), 0 if a hole (counter-clockwise)
+    """
+    # Convert flat list to coordinate pairs
+    points = [(polygon[i], polygon[i+1]) for i in range(0, len(polygon), 2)]
+    if len(points) < 3:
+        return 1  # Default to positive area if not enough points
+        
+    # Calculate signed area using Shoelace formula
+    signed_area = sum((points[i][0] * points[(i+1) % len(points)][1]) - 
+                      (points[i][1] * points[(i+1) % len(points)][0]) 
+                      for i in range(len(points)))
+    
+    # Clockwise (negative signed area) is positive segment (1)
+    # Counter-clockwise (positive signed area) is hole (0)
+    return 1 if signed_area < 0 else 0
+
+
+def create_segmentation_mask(segmentation, segmentation_types, img_height, img_width):
+    """
+    Create a binary mask from segmentation polygons, properly handling holes and multiple-segments. 
+    Note, post_mask/hole_mask and final_mask are inverted shape (H, W).
+    
+    Args:
+        segmentation (list): List of segmentation polygons
+        segmentation_types (list): List indicating if each polygon is positive (1) or hole (0)
+        img_height (int): Height of the image
+        img_width (int): Width of the image
+    
+    Returns:
+        torch.Tensor: Binary mask with holes properly handled
+    """
+    if not isinstance(segmentation, list) or len(segmentation) == 0:
+        return None
+
+    # If segmentation_types is None, infer from polygon orientation
+    if segmentation_types is None:
+        segmentation_types = [determine_polygon_orientation(seg) for seg in segmentation]
+        
+        # Ensure at least one segment is a positive area (type 1)
+        if 1 not in segmentation_types and len(segmentation_types) > 0:
+            segmentation_types[0] = 1  # Force first segment to be positive
+
+    final_mask = None
+    
+    if segmentation_types and len(segmentation_types) == len(segmentation):
+        # Handle multi-part segmentation with holes
+        positive_segments = [seg for i, seg in enumerate(segmentation) if segmentation_types[i] == 1]
+        hole_segments = [seg for i, seg in enumerate(segmentation) if segmentation_types[i] == 0]
+        
+        if positive_segments:
+            # Convert positive segments to RLEs and merge
+            pos_rles = mask_utils.frPyObjects(positive_segments, img_height, img_width)
+            merged_pos_rle = mask_utils.merge(pos_rles)
+            pos_mask = mask_utils.decode(merged_pos_rle)  # shape: (H, W)
+            
+            if hole_segments:
+                # Convert hole segments to RLEs and merge
+                hole_rles = mask_utils.frPyObjects(hole_segments, img_height, img_width)
+                merged_hole_rle = mask_utils.merge(hole_rles)
+                hole_mask = mask_utils.decode(merged_hole_rle)  # shape: (H, W)
+                
+                # Subtract hole mask from positive mask
+                final_mask = pos_mask - hole_mask
+            else:
+                final_mask = pos_mask
+        else:
+            return None
+    else:
+        # Simple segmentation (single part or no type info) - treat as positive
+        rles = mask_utils.frPyObjects(segmentation, img_height, img_width)
+        final_mask = mask_utils.decode(mask_utils.merge(rles))  # shape: (H, W)
+    
+    if final_mask is not None:
+        return torch.from_numpy(final_mask).float()
+    return None
+
 class ObjectClassifDataset(Dataset):
     def __init__(
         self,
@@ -22,7 +106,8 @@ class ObjectClassifDataset(Dataset):
         transform: Optional[Callable] = None,
         segment_objects: bool = True,
         resize_dim: int = 64,
-        dynamic_resizing: bool = False
+        dynamic_resizing: bool = False,
+        return_idx: bool = False
     ):
         self.annotations = annotations
         self.image_dir = image_dir
@@ -32,6 +117,7 @@ class ObjectClassifDataset(Dataset):
         self.image_cache = {}
         self.segment_objects = segment_objects
         self.dynamic_resizing = dynamic_resizing
+        self.return_idx = return_idx
         
     def __len__(self):
         return len(self.annotations)
@@ -42,6 +128,8 @@ class ObjectClassifDataset(Dataset):
         category_id = annotation["category_id"]
         bbox = annotation["bbox"]
         segmentation = annotation["segmentation"]
+        segmentation_types = annotation.get("segmentation_types", None)
+        annot_id = annotation["id"]
         
         # Get image info
         img_info = self.image_info[image_id]
@@ -55,7 +143,6 @@ class ObjectClassifDataset(Dataset):
             
             # Limit cache size to prevent memory issues
             if len(self.image_cache) > 10:
-                # Remove oldest item from cache (first in dictionary)
                 remove_id = next(iter(self.image_cache))
                 if remove_id != image_id:
                     del self.image_cache[remove_id]
@@ -68,14 +155,23 @@ class ObjectClassifDataset(Dataset):
         
         # Apply segmentation mask if requested
         if self.segment_objects and segmentation:
-            if isinstance(segmentation, list) and len(segmentation) > 0:
-                rles = mask_utils.frPyObjects(segmentation, img_info["height"], img_info["width"])
-                full_mask = mask_utils.decode(mask_utils.merge(rles))
+            # Create mask using the helper function
+            full_mask = create_segmentation_mask(
+                segmentation, 
+                segmentation_types, 
+                img_info["height"], 
+                img_info["width"]
+            )
+            
+            if full_mask is not None:
+                # Crop mask to bbox
+                mask = full_mask[y:y+h, x:x+w]
                 
-                mask = torch.from_numpy(full_mask[y:y+h, x:x+w]).float()
+                # If image has more dimensions than mask, expand mask for broadcasting
+                if obj_img.dim() == 3 and mask.dim() == 2:
+                    mask = mask.unsqueeze(-1)
                 
-                if mask.dim() < obj_img.dim():
-                    mask = mask.unsqueeze(0)
+                # Apply mask to object image
                 obj_img = obj_img * mask
 
         # Add channel dimension if needed
@@ -136,9 +232,11 @@ class ObjectClassifDataset(Dataset):
         
         if self.transform:
             obj_img = self.transform(obj_img)
-        
-        return {'image': obj_img, 'label': category_id}
 
+        if self.return_idx:
+            return {'image': obj_img, 'label': category_id, 'id': annot_id}
+        else:
+            return {'image': obj_img, 'label': category_id}
 
 class ObjectClassifDatasetCreator:
     """
@@ -186,7 +284,8 @@ class ObjectClassifDatasetCreator:
         val_transform: Optional[Callable] = None,
         batch_size: int = 32,
         dynamic_resizing: bool = False,
-        segment_objects: bool = True
+        segment_objects: bool = True,
+        return_idx: bool = False
     ) -> Tuple[DataLoader, DataLoader]:
         """
         Create training and validation datasets/dataloaders.
@@ -197,6 +296,7 @@ class ObjectClassifDatasetCreator:
             batch_size: Batch size for dataloaders
             dynamic_resizing: If True, only resize objects larger than resize_dim
             segment_objects: If True, applies segmentation masks to objects
+            return_idx: If True, returns the index of the object in the original image
         
         Returns:
             Tuple containing training and validation DataLoaders
@@ -214,7 +314,8 @@ class ObjectClassifDatasetCreator:
             transform=train_transform,
             resize_dim=self.resize_dim,
             dynamic_resizing=dynamic_resizing,
-            segment_objects=segment_objects
+            segment_objects=segment_objects,
+            return_idx=return_idx
         )
         
         val_dataset = ObjectClassifDataset(
@@ -224,7 +325,8 @@ class ObjectClassifDatasetCreator:
             transform=val_transform,
             resize_dim=self.resize_dim,
             dynamic_resizing=dynamic_resizing,
-            segment_objects=segment_objects
+            segment_objects=segment_objects,
+            return_idx=return_idx
         )
         
         # Create dataloaders
